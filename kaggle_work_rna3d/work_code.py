@@ -2,12 +2,12 @@
 ======================================================
 Strategy:
   Primary  : RhoFold+ (deep learning — upload weights to Kaggle dataset)
-  Fallback : Improved template retrieval (k-mer cosine + SM alignment + NW coord transfer)
+  Fallback : Improved template retrieval (k-mer cosine + global alignment + coord transfer)
 
 Bug fixes vs v1:
   - TM-score now uses L_ref = len(true), not min(pred, true)  [was dividing by wrong length]
   - temporal_cutoff filter no longer falls back to full pool on empty result
-  - NW O(nm) replaced by SequenceMatcher O(n) for alignment map
+  - sequence alignment uses global Needleman-Wunsch for robust mapping
   - MSA conservation threshold is adaptive (40th-percentile) instead of hardcoded 0.60
   - 5 diversity profiles are structurally distinct (not just amplitude-scaled copies)
 
@@ -26,7 +26,6 @@ import sys
 import time
 import zlib
 from dataclasses import dataclass
-from difflib import SequenceMatcher
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -372,13 +371,53 @@ def filter_templates_by_cutoff(templates: List[Template], cutoff: Optional[str])
 # Alignment-based coordinate transfer
 # ─────────────────────────────────────────────────────────
 def _alignment_map(query: str, target: str) -> np.ndarray:
-    """SequenceMatcher alignment map (O(n) vs O(nm) for full NW DP)."""
-    q_to_t = np.full(len(query), -1, dtype=np.int32)
-    sm = SequenceMatcher(a=query, b=target, autojunk=False)
-    for block in sm.get_matching_blocks():
-        ai, bi, size = block.a, block.b, block.size
-        for k in range(size):
-            q_to_t[ai + k] = bi + k
+    """Global Needleman-Wunsch alignment map from query index to target index."""
+    n, m = len(query), len(target)
+    q_to_t = np.full(n, -1, dtype=np.int32)
+    if n == 0 or m == 0:
+        return q_to_t
+
+    match_score, mismatch_score, gap_score = 2, -1, -2
+
+    # dp: best score, tb: traceback move (1=diag, 2=up, 3=left)
+    dp = np.empty((n + 1, m + 1), dtype=np.int32)
+    tb = np.zeros((n + 1, m + 1), dtype=np.uint8)
+    dp[0, 0] = 0
+    for i in range(1, n + 1):
+        dp[i, 0] = i * gap_score
+        tb[i, 0] = 2
+    for j in range(1, m + 1):
+        dp[0, j] = j * gap_score
+        tb[0, j] = 3
+
+    for i in range(1, n + 1):
+        qi = query[i - 1]
+        for j in range(1, m + 1):
+            diag = dp[i - 1, j - 1] + (match_score if qi == target[j - 1] else mismatch_score)
+            up = dp[i - 1, j] + gap_score
+            left = dp[i, j - 1] + gap_score
+            if diag >= up and diag >= left:
+                dp[i, j] = diag
+                tb[i, j] = 1
+            elif up >= left:
+                dp[i, j] = up
+                tb[i, j] = 2
+            else:
+                dp[i, j] = left
+                tb[i, j] = 3
+
+    i, j = n, m
+    while i > 0 or j > 0:
+        move = int(tb[i, j]) if (i >= 0 and j >= 0) else 0
+        if move == 1:
+            q_to_t[i - 1] = j - 1
+            i -= 1
+            j -= 1
+        elif move == 2:
+            i -= 1
+        else:
+            j -= 1
+
     return q_to_t
 
 
@@ -406,17 +445,22 @@ def _estimate_bond_len(coords: np.ndarray) -> float:
     return float(np.clip(np.median(d), 4.5, 7.5)) if len(d) > 0 else 6.0
 
 
-def map_coords_by_alignment(query_seq: str, tpl: Template) -> Tuple[np.ndarray, np.ndarray]:
+def map_coords_by_alignment(
+    query_seq: str,
+    tpl: Template,
+    q_to_t: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
     n = len(query_seq)
     if n == 0:
         return np.zeros((0, 3), dtype=np.float32), np.zeros(0, dtype=bool)
 
-    q_to_t = _alignment_map(query_seq, tpl.sequence)
+    if q_to_t is None:
+        q_to_t = _alignment_map(query_seq, tpl.sequence)
     out = np.full((n, 3), np.nan, dtype=np.float32)
     mapped = np.zeros(n, dtype=bool)
 
     for qi, tj in enumerate(q_to_t):
-        if 0 <= tj < len(tpl.coords):
+        if 0 <= tj < len(tpl.coords) and bool(tpl.obs_mask[tj]):
             out[qi] = tpl.coords[tj]
             mapped[qi] = True
 
@@ -739,12 +783,25 @@ def template_predict_five(
 
     coarse.sort(key=lambda x: x[0], reverse=True)
 
-    # Stage 2: SequenceMatcher alignment rerank on top-64
+    # Stage 2: global-alignment rerank on top-64
     pre = [t for _, t in coarse[:max(64, top_k * 16)]]
-    reranked = [
-        (float(SequenceMatcher(a=query_seq, b=t.sequence, autojunk=False).ratio()), t)
-        for t in pre
-    ]
+    align_cache: Dict[str, np.ndarray] = {}
+    reranked = []
+    for t in pre:
+        q_to_t = _alignment_map(query_seq, t.sequence)
+        align_cache[t.template_id] = q_to_t
+        mapped = q_to_t >= 0
+        mapped_frac = float(mapped.mean()) if len(mapped) > 0 else 0.0
+        if mapped.any():
+            q_idx = np.where(mapped)[0]
+            t_idx = q_to_t[mapped]
+            matches = sum(1 for qi, tj in zip(q_idx, t_idx) if query_seq[qi] == t.sequence[tj])
+            seq_id = matches / max(1, len(q_idx))
+        else:
+            seq_id = 0.0
+        score = 0.70 * seq_id + 0.30 * mapped_frac
+        reranked.append((float(score), t))
+
     reranked.sort(key=lambda x: x[0], reverse=True)
     chosen = select_diverse_templates(reranked, k=top_k)
 
@@ -753,13 +810,19 @@ def template_predict_five(
     preds = []
 
     for i, tpl in enumerate(chosen):
-        base, mapped = map_coords_by_alignment(query_seq, tpl)
+        base, mapped = map_coords_by_alignment(
+            query_seq, tpl, q_to_t=align_cache.get(tpl.template_id)
+        )
         flex = ~mapped
         if msa_cons is not None and len(msa_cons) == len(flex):
             # Adaptive threshold: positions below 40th-percentile are flexible
             thr = float(np.percentile(msa_cons[np.isfinite(msa_cons)], 40))
             flex = flex | (msa_cons < thr)
-        preds.append(diversify(base, i, flex, seed_base + i))
+        if i == 0:
+            # Keep one clean template-transfer candidate (no perturbation).
+            preds.append(base.astype(np.float32))
+        else:
+            preds.append(diversify(base, i, flex, seed_base + i))
 
     while len(preds) < N_MODELS:
         base = preds[0].copy() if preds else make_helix(n, 0)
